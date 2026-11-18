@@ -15,3 +15,24 @@ test('empty saved content stays empty rather than reseeding',async()=>{assert.de
 test('invalid image URLs and incomplete content are rejected',()=>{const base={kind:'blog',status:'published',title:'Test',body:'Body'};assert.throws(()=>cms.validate({...base,image:'javascript:alert(1)'}));assert.throws(()=>cms.validate({...base,title:''}));assert.equal(cms.validate({...base,image:'https://example.com/image.png'}).title,'Test')});
 test('mutations require same origin',()=>{assert.equal(cms.originAllowed(new Request('https://example.com/api',{headers:{origin:'https://evil.test'}})),false);assert.equal(cms.originAllowed(new Request('https://example.com/api',{headers:{origin:'https://example.com'}})),true)});
 test('HTML content is escaped',()=>assert.equal(cms.esc('<script>"x"</script>'),'&lt;script&gt;&quot;x&quot;&lt;/script&gt;'));
+
+class MissingBlob extends Error {}
+class VersionConflict extends Error {}
+const blobMock={head:async()=>({etag:'api-version'}),get:async()=>({statusCode:200,stream:new Response('{"title":"current"}').body,blob:{etag:'W/"encoded-version"'}}),put:async(_p,_data,options)=>options,BlobNotFoundError:MissingBlob,BlobPreconditionFailedError:VersionConflict};
+globalThis.__verdantBlobTest=blobMock;
+const storage=await moduleFrom('../lib/storage.ts',s=>s.replace(/import .* from '@vercel\/blob';/,'const {BlobNotFoundError,BlobPreconditionFailedError}=globalThis.__verdantBlobTest; const head=(...a)=>globalThis.__verdantBlobTest.head(...a); const get=(...a)=>globalThis.__verdantBlobTest.get(...a); const put=(...a)=>globalThis.__verdantBlobTest.put(...a);'));
+test('storage returns the API version, not a transformed or missing GET ETag',async()=>{const doc=await storage.readDocument('content');assert.equal(doc.etag,'api-version');const options=await storage.writeDocument('content',doc.data,doc.etag);assert.equal(options.ifMatch,'api-version');assert.equal(options.allowOverwrite,true)});
+test('storage retries if a write occurs during its body read',async()=>{let heads=0,reads=0;const oldHead=blobMock.head,oldGet=blobMock.get;blobMock.head=async()=>({etag:++heads===1?'old':'new'});blobMock.get=async()=>({statusCode:200,stream:new Response(JSON.stringify({generation:++reads})).body,blob:{etag:''}});try{const doc=await storage.readDocument('content');assert.deepEqual(doc,{data:{generation:2},etag:'new'})}finally{blobMock.head=oldHead;blobMock.get=oldGet}});
+test('empty version never turns an update into an unconditional overwrite',async()=>{await assert.rejects(()=>storage.writeDocument('content',{},''));const create=await storage.writeDocument('content',{});assert.equal(create.allowOverwrite,false);assert.equal(create.ifMatch,undefined)});
+let collection=[],version=1,saveCalls=0,onFirstSave;
+globalThis.__verdantCmsTest={
+ contentDocument:async()=>({data:structuredClone(collection),etag:String(version)}),
+ saveContent:async(records,etag)=>{saveCalls++;if(saveCalls===1&&onFirstSave){onFirstSave();throw new VersionConflict()}assert.equal(etag,String(version));collection=records;version++},
+ isAdmin:async()=>true,listContent:async()=>collection,validate:cms.validate,originAllowed:cms.originAllowed,json:cms.json,
+ isStorageConflict:e=>e instanceof VersionConflict,
+};
+const route=await moduleFrom('../app/api/admin/content/route.ts',s=>s.replace(/import .* from '\.\.\/\.\.\/\.\.\/\.\.\/lib\/cms';/,"const {contentDocument,saveContent,isAdmin,listContent,validate,originAllowed,json}=globalThis.__verdantCmsTest;").replace(/import .* from '\.\.\/\.\.\/\.\.\/\.\.\/lib\/storage';/,"const {isStorageConflict}=globalThis.__verdantCmsTest;"));
+const request=(method,body)=>new Request('https://example.com/api/admin/content',{method,headers:{origin:'https://example.com','content-type':'application/json'},body:JSON.stringify(body)});
+const draft={kind:'product',status:'published',category:'balanced',title:'New NPK',body:'Product details'};
+test('creating a product retries a competing collection write without duplicates or data loss',async()=>{collection=[];version=1;saveCalls=0;onFirstSave=()=>{collection.push({id:'other',title:'Other product',revision:0});version++};const r=await route.POST(request('POST',draft));assert.equal(r.status,201);assert.equal(collection.length,2);assert.equal(collection.filter(x=>x.title==='New NPK').length,1);assert.equal(collection[0].id,'other');assert.equal(saveCalls,2)});
+test('editing rejects a concurrent edit of the same product instead of overwriting it',async()=>{collection=[{...draft,id:'existing',revision:0}];version=1;saveCalls=0;onFirstSave=()=>{collection[0].revision=1;collection[0].title='Saved by another session';version++};const r=await route.PUT(request('PUT',{...draft,id:'existing',revision:0,title:'My edit'}));assert.equal(r.status,409);assert.equal(collection[0].title,'Saved by another session');assert.equal(saveCalls,1)});
