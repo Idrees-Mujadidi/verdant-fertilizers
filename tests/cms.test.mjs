@@ -1,0 +1,43 @@
+import { readFileSync } from 'node:fs';
+import {createRequire} from 'node:module';
+import {Miniflare} from 'miniflare';
+import ts from 'typescript';
+import assert from 'node:assert/strict';
+const mf=new Miniflare({modules:true,script:'export default {fetch(){return new Response("test")}}',d1Databases:['DB'],r2Buckets:['BUCKET']});
+const DB=await mf.getD1Database('DB');const BUCKET=await mf.getR2Bucket('BUCKET');
+const sql=readFileSync('drizzle/0000_cheerful_roland_deschain.sql','utf8').split('--> statement-breakpoint');for(const statement of sql)await DB.prepare(statement.trim()).run();
+let user=null;const env={DB,BUCKET,ADMIN_BOOTSTRAP_EMAIL:'owner@example.test'};
+const nativeRequire=createRequire(import.meta.url),cache={};
+function load(path){if(cache[path])return cache[path];const out=ts.transpileModule(readFileSync(path,'utf8'),{compilerOptions:{module:ts.ModuleKind.CommonJS,target:ts.ScriptTarget.ES2022}}).outputText;const exports={};const require=(name)=>name==='cloudflare:workers'?{env}:name.endsWith('chatgpt-auth')?{getChatGPTUser:async()=>user}:name.endsWith('/cms')?load('lib/cms.ts'):nativeRequire(name);new Function('require','exports',out)(require,exports);return cache[path]=exports;}
+const cms=load('lib/cms.ts'),api=load('app/api/admin/content/route.ts'),uploads=load('app/api/admin/upload/route.ts');
+const req=(method,data,origin='https://test.site')=>new Request('https://test.site/api/admin/content',{method,headers:{origin,'content-type':'application/json'},body:JSON.stringify(data)});
+try{
+ assert.equal((await api.GET()).status,403);
+ user={userId:'wrong-id',email:'intruder@example.test'};assert.equal((await api.GET()).status,403);
+ user={userId:'owner-id',email:'owner@example.test'};
+ assert.equal((await api.GET()).status,200);assert.equal((await cms.listContent()).length,3);
+ const value={kind:'blog',status:'draft',title:'Test story <script>',body:'Paragraph one.\n\nParagraph two.',summary:'Test summary',image:'',category:'',price:'',size:''};
+ let response=await api.POST(req('POST',value));assert.equal(response.status,201);const {id}=await response.json();
+ assert.equal((await cms.listContent()).some(x=>x.id===id),false,'Draft must remain private');
+ let item=(await (await api.GET()).json()).find(x=>x.id===id);assert.equal(item.revision,1);
+ assert.equal((await api.PUT(req('PUT',{...item,status:'published'}))).status,200);
+ assert.equal((await cms.listContent()).find(x=>x.id===id).body,value.body);
+ assert.equal((await api.PUT(req('PUT',{...item,status:'published'}))).status,409,'Stale writes rejected');
+ assert.equal((await api.POST(req('POST',value,'https://evil.site'))).status,403,'Cross-origin writes rejected');
+ assert.equal((await api.POST(req('POST',{...value,image:'javascript:alert(1)'}))).status,400);
+ assert.equal((await api.POST(req('POST',{...value,title:''}))).status,400);
+ assert.equal((await api.POST(req('POST',{...value,kind:'product',category:'invalid'}))).status,400);
+ user={userId:'intruder-id',email:'owner@example.test'};assert.equal((await api.GET()).status,403,'Pinned ID required after provisioning');
+ user={userId:'owner-id',email:'changed@example.test'};assert.equal((await api.GET()).status,200,'Stable identity survives email change');
+ assert.equal((await api.DELETE(req('DELETE',{id,revision:2}))).status,200);assert.equal((await cms.listContent()).some(x=>x.id===id),false);
+ const product={...value,kind:'product',category:'soil',title:'Test product',status:'published',price:'AFN 500',size:'25 kg'};
+ const created=await api.POST(req('POST',product));assert.equal(created.status,201);const pid=(await created.json()).id;
+ const saved=(await cms.listContent()).find(x=>x.id===pid);assert.equal(saved.price,'AFN 500');assert.equal(saved.size,'25 kg');
+ assert.equal((await api.DELETE(req('DELETE',{id:pid,revision:1}))).status,200);
+ await api.DELETE(req('DELETE',{id:'nitrogen',revision:1}));await cms.seed();assert.equal((await cms.listContent()).some(x=>x.id==='nitrogen'),false,'Deleted seed products never resurrect');
+ const form=new FormData();form.append('file',new File([new Uint8Array([137,80,78,71,13,10,26,10])],'test.png',{type:'image/png'}));
+ const result=await uploads.POST(new Request('https://test.site/api/admin/upload',{method:'POST',headers:{origin:'https://test.site'},body:form}));assert.equal(result.status,200);const image=(await result.json()).url;assert.ok(await BUCKET.get(image.split('/').pop()));
+ const invalid=new FormData();invalid.append('file',new File(['<svg></svg>'],'image.svg',{type:'image/svg+xml'}));assert.equal((await uploads.POST(new Request('https://test.site/api/admin/upload',{method:'POST',headers:{origin:'https://test.site'},body:invalid}))).status,400);
+ assert.equal(cms.esc('<script>'), '&lt;script&gt;');
+ console.log('PASS: admin authorization, stable owner identity, product/blog CRUD, draft privacy, concurrency protection, validation, cross-origin rejection, seed deletion persistence, image storage and file checks.');
+}finally{await mf.dispose()}
