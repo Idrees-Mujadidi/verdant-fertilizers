@@ -2,17 +2,18 @@
 
 Fertilizer company website with an owner-only content dashboard at `/admin`.
 
-- Products and blog posts use D1. Only published records render on the website.
-- Image uploads use R2 and accept JPG, PNG, and WebP files up to 5 MB.
-- Sites owns sign-in. The server checks the authenticated identity on every admin operation.
-- `ADMIN_BOOTSTRAP_EMAIL` provisions the site owner's stable user ID once; later checks use the pinned ID in D1, not the email address. This secret is configured in Sites, never in browser code.
-- Mutations require a same-origin request and reject stale revisions.
-- The contact area still downloads an inquiry; it does not send email.
+## Vercel deployment
+
+This branch runs on Next.js and Vercel. Connect a **private Vercel Blob store** to the project. It stores product/blog records, uploaded images, and a salted scrypt admin password hash. Conditional ETag writes prevent lost updates. Draft records and unused images are not publicly accessible.
+
+Configure server-only `ADMIN_SESSION_SECRET` and `ADMIN_SETUP_TOKEN` as independent random 32-byte secrets. Never commit their values. Open `/admin/login#setup=<ADMIN_SETUP_TOKEN>` privately once to choose a password of at least 12 characters. After creation, the setup token cannot create another account. Sessions last eight hours. Five failed sign-ins lock login for 15 minutes. Keep the setup link private. Changing the session secret revokes sessions.
+
+The public website has product browsing, field notes, and an inquiry download. The admin supports product/blog create, edit, delete, drafts, publishing, and JPG/PNG/WebP uploads up to 4 MB (within Vercel request limits).
+
+The original Sites/Cloudflare deployment remains separate. Existing D1/R2 production records are not automatically copied to Vercel. A fresh store begins with three sample products and no blog posts. Deleting the samples does not recreate them.
 
 ## Development
 
-Use the Sites runtime helpers for installation, preview, build, and deployment. Run `npm run db:generate` for schema changes and apply generated SQL to local D1 before previewing.
+Node.js 22+: `npm ci`, `npm run dev`, `npm run build`.
 
-Checks: `npx tsc --noEmit` and `node tests/cms.test.mjs`.
-
-Local test databases are independent of production. The initial three sample products are seeded once. Deleting them does not recreate them.
+Use Vercel's environment integration for storage credentials. Never use filesystem or in-memory storage for production content.
